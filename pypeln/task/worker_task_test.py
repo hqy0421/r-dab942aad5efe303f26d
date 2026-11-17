@@ -527,3 +527,114 @@ async def test_del3_async():
 
     assert not task.cancelled()
     assert not worker.is_done
+
+
+# ----------------------------------------------------------------
+# Regression tests: failures must never be silently dropped
+# ----------------------------------------------------------------
+
+
+class SilentFailure(Exception):
+    pass
+
+
+async def _fail_on_zero(x):
+    if x == 0:
+        raise SilentFailure()
+
+    await asyncio.sleep(0.1)
+    return x
+
+
+def _run_in_thread(fn, timeout=20):
+    """
+    Run `fn` in a daemon thread so a hang fails the test instead of blocking
+    the whole test session.
+    """
+    box = {}
+
+    def target():
+        try:
+            box["result"] = fn()
+        except BaseException as e:
+            box["exception"] = e
+
+    import threading
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout)
+
+    assert not thread.is_alive(), "pipeline hung"
+
+    if "exception" in box:
+        raise box["exception"]
+
+    return box.get("result")
+
+
+def test_task_failure_not_swallowed_sync():
+    """
+    A task that fails early (completing before every other task) must still
+    surface its exception to the consumer.
+    """
+    with pytest.raises(SilentFailure):
+        _run_in_thread(lambda: list(pl.task.map(_fail_on_zero, range(30), workers=2)))
+
+
+def test_task_failure_not_swallowed_async():
+    async def main():
+        return await pl.task.map(_fail_on_zero, range(30), workers=2)
+
+    with pytest.raises(SilentFailure):
+        _run_in_thread(lambda: asyncio.run(main()))
+
+
+@pytest.mark.parametrize("api", ["map", "filter", "flat_map", "each"])
+def test_task_failure_not_swallowed_all_apis(api):
+    async def flat_map_fn(x):
+        if x == 0:
+            raise SilentFailure()
+
+        await asyncio.sleep(0.1)
+        return [x]
+
+    async def call():
+        if api == "map":
+            return await pl.task.map(_fail_on_zero, range(30), workers=4)
+        elif api == "filter":
+            return await pl.task.filter(_fail_on_zero, range(30), workers=4)
+        elif api == "flat_map":
+            return await pl.task.flat_map(flat_map_fn, range(30), workers=4)
+        else:
+            return await pl.task.each(_fail_on_zero, range(30), workers=4)
+
+    with pytest.raises(SilentFailure):
+        _run_in_thread(lambda: asyncio.run(call()))
+
+
+def test_task_failure_not_swallowed_run():
+    with pytest.raises(SilentFailure):
+        _run_in_thread(
+            lambda: pl.task.run(
+                pl.task.each(_fail_on_zero, range(30), workers=2)
+            )
+        )
+
+
+def test_task_timeout_still_skips():
+    """
+    Timeouts are not failures: the element is skipped and the run succeeds.
+    """
+
+    async def f(x):
+        if x == 2:
+            await asyncio.sleep(10)
+
+        return x
+
+    result = _run_in_thread(
+        lambda: sorted(list(pl.task.map(f, range(5), workers=1, timeout=0.05)))
+    )
+
+    assert result == [0, 1, 3, 4]

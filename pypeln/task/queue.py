@@ -15,32 +15,128 @@ PipelineException = pypeln_utils.PipelineException
 
 
 class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
+    """
+    An `asyncio.Queue` that knows when all of its sources are done and that can
+    carry a failure to its consumers.
+
+    A failure is stored (not consumed) on the `namespace` so every consumer,
+    current or future, sees it. Signalling consumers never blocks, even when
+    the queue is full: blocking here would deadlock a producer that is trying
+    to report an error while the consumer is gone.
+    """
+
     def __init__(self, maxsize: int = 0, total_sources: int = 1):
         super().__init__(maxsize=maxsize)
 
         self.namespace = utils.Namespace(
             remaining=total_sources, exception=False, force_stop=False
         )
-        self.exception_queue: asyncio.Queue[PipelineException] = asyncio.Queue(
-            maxsize=1
-        )
+        # Kept for backwards compatibility, it holds the first exception.
+        self.exception_queue: asyncio.Queue[PipelineException] = asyncio.Queue()
+
+    # ----------------------------------------------------------------
+    # exception handling
+    # ----------------------------------------------------------------
+
+    def _get_pipeline_exception(self) -> tp.Optional[PipelineException]:
+        exception = self.namespace.exception
+
+        if isinstance(exception, PipelineException):
+            return exception
+
+        try:
+            return self.exception_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return None
+
+    def _raise_pipeline_exception(self):
+        pipeline_exception = self._get_pipeline_exception()
+
+        if pipeline_exception is None:
+            return
+
+        exception, trace = pipeline_exception
+
+        try:
+            exception = exception(f"\n\n{trace}")
+        except BaseException:
+            exception = Exception(f"\n\nOriginal: {exception}\n\n{trace}")
+
+        raise exception
+
+    def _signal(self, value: tp.Any):
+        """
+        Wake up blocked consumers without ever blocking the caller.
+        """
+        waiters = list(self._getters)
+
+        try:
+            self.put_nowait(value)
+        except asyncio.QueueFull:
+            # A full queue means no consumer is blocked waiting for an item,
+            # so there is nobody to wake up.
+            pass
+
+        if waiters:
+            self._wake_loops(waiters)
+
+    @staticmethod
+    def _wake_loops(waiters: tp.Iterable[tp.Any]):
+        """
+        A synchronous consumer / producer may free or fill a slot from a thread
+        that is not the one running the event loop. `asyncio.Queue` schedules
+        the woken waiter's callback on that loop but does not wake the
+        selector, so a loop with nothing else to do can sleep forever. Nudge
+        every loop that has a waiter.
+        """
+        loops = set()
+
+        for waiter in waiters:
+            loop = getattr(waiter, "get_loop", None)
+
+            if loop is not None:
+                loop = loop()
+            else:
+                loop = getattr(waiter, "_loop", None)
+
+            if loop is not None:
+                loops.add(loop)
+
+        for loop in loops:
+            if loop.is_closed():
+                continue
+
+            try:
+                loop.call_soon_threadsafe(lambda: None)
+            except RuntimeError:
+                pass
+
+    def _get_nowait_unlocked(self) -> tp.Any:
+        """
+        Like `get_nowait` but wakes the loop of the producer it unblocks.
+        """
+        putters = list(self._putters)
+
+        x = super().get_nowait()
+
+        if putters:
+            self._wake_loops(putters)
+
+        return x
+
+    # ----------------------------------------------------------------
+    # get / iteration
+    # ----------------------------------------------------------------
 
     async def get(self) -> tp.Awaitable[T]:
         while True:
-            # with self.namespace:
-            has_exception = self.namespace.exception
-
-            if has_exception:
-                exception, trace = await self.exception_queue.get()
-
-                try:
-                    exception = exception(f"\n\n{trace}")
-                except:
-                    exception = Exception(f"\n\nOriginal: {exception}\n\n{trace}")
-
-                raise exception
+            if self.namespace.exception:
+                self._raise_pipeline_exception()
 
             x = await super().get()
+
+            if self.namespace.exception:
+                self._raise_pipeline_exception()
 
             if isinstance(x, pypeln_utils.Done):
                 self.namespace.remaining -= 1
@@ -49,20 +145,10 @@ class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
 
     def _get_nowait(self) -> T:
         while True:
-            # with self.namespace:
-            has_exception = self.namespace.exception
+            if self.namespace.exception:
+                self._raise_pipeline_exception()
 
-            if has_exception:
-                exception, trace = self.exception_queue.get_nowait()
-
-                try:
-                    exception = exception(f"\n\n{trace}")
-                except:
-                    exception = Exception(f"\n\nOriginal: {exception}\n\n{trace}")
-
-                raise exception
-
-            x = super().get_nowait()
+            x = self._get_nowait_unlocked()
 
             if isinstance(x, pypeln_utils.Continue):
                 continue
@@ -73,7 +159,15 @@ class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
             return x
 
     def __iter__(self) -> tp.Iterator[T]:
-        while not self.is_done():
+        while True:
+            if self.namespace.exception:
+                self._raise_pipeline_exception()
+
+            if self.is_done():
+                if self.namespace.exception:
+                    self._raise_pipeline_exception()
+                return
+
             try:
                 x = self._get_nowait()
             except asyncio.QueueEmpty:
@@ -83,13 +177,21 @@ class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
             yield x
 
     async def __aiter__(self) -> tp.AsyncIterator[T]:
-        while not self.is_done():
+        while True:
+            if self.namespace.exception:
+                self._raise_pipeline_exception()
+
+            if self.is_done():
+                if self.namespace.exception:
+                    self._raise_pipeline_exception()
+                return
+
             x = await self.get()
 
             if isinstance(x, pypeln_utils.Continue):
                 continue
             elif isinstance(x, pypeln_utils.Done):
-                self.namespace.remaining -= 1
+                # `get` already accounted for this source.
                 continue
 
             yield x
@@ -99,6 +201,10 @@ class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
             self.namespace.remaining <= 0 and self.empty()
         )
 
+    # ----------------------------------------------------------------
+    # lifecycle
+    # ----------------------------------------------------------------
+
     async def worker_done(self):
         await self.put(pypeln_utils.DONE)
 
@@ -107,44 +213,54 @@ class IterableQueue(asyncio.Queue, tp.Generic[T], tp.Iterable[T]):
 
     async def stop(self):
         self.namespace.remaining = 0
-        await self.put(pypeln_utils.CONTINUE)
+        self._signal(pypeln_utils.CONTINUE)
 
     def stop_nowait(self):
         self.namespace.remaining = 0
-        self.put_nowait(pypeln_utils.CONTINUE)
+        self._signal(pypeln_utils.CONTINUE)
 
     async def kill(self):
         self.namespace.force_stop = True
-        await self.put(pypeln_utils.CONTINUE)
+        self._signal(pypeln_utils.CONTINUE)
 
     def kill_nowait(self):
         self.namespace.force_stop = True
-        self.put_nowait(pypeln_utils.CONTINUE)
+        self._signal(pypeln_utils.CONTINUE)
 
     async def raise_exception(self, exception: BaseException):
-        pypeline_exception = self.get_pipeline_exception(exception)
-
-        self.namespace.exception = True
-        await self.exception_queue.put(pypeline_exception)
-        await self.put(pypeln_utils.CONTINUE)
+        self.raise_exception_nowait(exception)
 
     def raise_exception_nowait(self, exception: BaseException):
-        pypeline_exception = self.get_pipeline_exception(exception)
+        pipeline_exception = self.get_pipeline_exception(exception)
 
-        self.namespace.exception = True
-        self.exception_queue.put_nowait(pypeline_exception)
-        self.put_nowait(pypeln_utils.CONTINUE)
+        if not self.namespace.exception:
+            self.namespace.exception = pipeline_exception
+
+            try:
+                self.exception_queue.put_nowait(pipeline_exception)
+            except asyncio.QueueFull:
+                pass
+
+        self._signal(pypeln_utils.CONTINUE)
 
     def get_pipeline_exception(self, exception: BaseException) -> PipelineException:
         if isinstance(exception, PipelineException):
             return exception
 
-        exception_type, _exception, _traceback = sys.exc_info()
+        if isinstance(exception, BaseException):
+            exception_type = type(exception)
+            traceback_object = exception.__traceback__
+            args = getattr(exception, "args", ())
+        else:
+            exception_type, _exception, traceback_object = sys.exc_info()
+            exception_type = exception_type or type(exception)
+            args = getattr(exception, "args", ())
+
         trace = "".join(
-            traceback.format_exception(exception_type, _exception, _traceback)
+            traceback.format_exception(exception_type, exception, traceback_object)
         )
 
-        trace = f"{exception.args}\n\n{trace}"
+        trace = f"{args}\n\n{trace}"
 
         return PipelineException(exception_type, trace)
 

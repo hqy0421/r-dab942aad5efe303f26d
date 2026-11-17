@@ -508,3 +508,155 @@ class TestTaskPool(unittest.TestCase):
             assert time.time() - t0 < timeout
 
         assert namespace.x == 1
+
+
+# ----------------------------------------------------------------
+# Regression tests: failure signalling and end-of-stream semantics
+# ----------------------------------------------------------------
+
+
+class TestQueueFailureSemantics(TestCase):
+    def test_exception_is_not_lost_when_queue_is_full(self):
+        """
+        Reporting a failure must not block on a full queue: with no consumer
+        awake, a blocking signal would hang the producer forever.
+        """
+        queue = pl.task.IterableQueue(maxsize=1)
+        queue.put_nowait("occupied")
+
+        async def worker():
+            try:
+                raise MyException()
+            except BaseException as e:
+                await asyncio.wait_for(queue.raise_exception(e), timeout=1)
+
+        processes = pl.task.start_workers(worker)
+        processes[0].result(timeout=5)
+
+        with pytest.raises(MyException):
+            list(queue)
+
+    def test_exception_is_visible_to_later_consumers(self):
+        queue = pl.task.IterableQueue()
+
+        async def worker():
+            try:
+                raise MyException()
+            except BaseException as e:
+                await queue.raise_exception(e)
+
+        pl.task.start_workers(worker)
+
+        with pytest.raises(MyException):
+            list(queue)
+
+        # The failure is stored, not consumed: a second reader sees it too.
+        with pytest.raises(MyException):
+            list(queue)
+
+    @run_test_async
+    async def test_multiple_sources_all_must_finish(self):
+        """
+        A queue fed by N sources must only be done after every source emitted
+        its `Done`; one source finishing early cannot end the iteration.
+        """
+        n_sources = 3
+        queue = pl.task.IterableQueue(total_sources=n_sources)
+
+        async def worker(i):
+            await asyncio.sleep(0.01 * (n_sources - i))
+            await queue.put(i)
+            await queue.worker_done()
+
+        for i in range(n_sources):
+            pl.task.start_workers(lambda i=i: worker(i), n_workers=1)
+
+        result = [x async for x in queue]
+
+        assert sorted(result) == list(range(n_sources))
+
+    def test_consumer_wakes_cross_thread_producer(self):
+        """
+        A synchronous consumer draining the queue from another thread must
+        wake a producer blocked on `put`, otherwise the pipeline deadlocks.
+
+        This is the shape of `IterableQueue.__iter__`: the loop lives in a
+        background thread while the consumer calls `_get_nowait` from the
+        thread that created the pipeline.
+        """
+        queue = pl.task.IterableQueue(maxsize=1)
+
+        async def producer():
+            for i in range(5):
+                await queue.put(i)
+
+            await queue.worker_done()
+
+        processes = pl.task.start_workers(producer)
+
+        result = list(queue)
+
+        assert result == list(range(5))
+        processes[0].result(timeout=5)
+
+    def test_is_done_requires_all_sources(self):
+        queue = pl.task.IterableQueue(total_sources=2)
+        queue.put_nowait(1)
+        assert queue._get_nowait() == 1
+
+        # One source finishes, the other still has to report.
+        queue.put_nowait(pl.utils.DONE)
+
+        with pytest.raises(asyncio.QueueEmpty):
+            queue._get_nowait()
+
+        assert not queue.is_done()
+
+        queue.put_nowait(pl.utils.DONE)
+
+        with pytest.raises(asyncio.QueueEmpty):
+            queue._get_nowait()
+
+        assert queue.is_done()
+
+
+class TestAsyncSourceCompletion(TestCase):
+    @run_test_async
+    async def test_one_source_done_does_not_end_async_iteration(self):
+        """
+        `Done` used to be accounted twice (once in `get`, once in `__aiter__`),
+        so with N sources the first `Done` could end the iteration and every
+        other source's results were lost.
+        """
+        queue = pl.task.IterableQueue(total_sources=2)
+
+        async def consume():
+            return [x async for x in queue]
+
+        consumer = asyncio.ensure_future(consume())
+
+        # First source finishes.
+        await queue.put(pl.utils.DONE)
+        await asyncio.sleep(0.05)
+
+        assert not consumer.done(), "iteration ended before all sources finished"
+
+        # Second source still has data.
+        await queue.put("late")
+        await queue.put(pl.utils.DONE)
+
+        result = await asyncio.wait_for(consumer, timeout=5)
+
+        assert result == ["late"]
+
+    @run_test_async
+    async def test_remaining_counts_each_source_once(self):
+        queue = pl.task.IterableQueue(total_sources=2)
+
+        await queue.put(pl.utils.DONE)
+        assert await queue.get() is pl.utils.DONE
+        assert queue.namespace.remaining == 1
+
+        await queue.put(pl.utils.DONE)
+        assert await queue.get() is pl.utils.DONE
+        assert queue.namespace.remaining == 0

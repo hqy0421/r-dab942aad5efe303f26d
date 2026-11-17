@@ -1,5 +1,4 @@
 import asyncio
-import time
 import typing as tp
 
 from pypeln import utils as pypeln_utils
@@ -9,6 +8,24 @@ from .. import utils
 from ..queue import IterableQueue
 from ..stage import Stage
 from ..worker import ProcessFn, Worker
+
+
+async def _wait_closed(worker: Worker):
+    event = worker.closed_event
+
+    if event is None:
+        # Worker has not started yet (should not happen in practice), fall back
+        # to polling its `is_done` flag.
+        while not worker.is_done:
+            await asyncio.sleep(_PUT_POLL_INTERVAL)
+        return
+
+    await event.wait()
+
+
+# How long to wait before re-checking a worker that has not created its
+# `closed_event` yet.
+_PUT_POLL_INTERVAL = 0.01
 
 
 class FromIterable(tp.NamedTuple):
@@ -65,22 +82,75 @@ class FromIterable(tp.NamedTuple):
                 if not isinstance(x, pypeln_utils.Element):
                     x = pypeln_utils.Element(index=(i,), value=x)
 
-                if worker.is_done:
+                if not FromIterable.put(worker, queue, x, loop):
                     return
 
-                while queue.full():
-                    if worker.is_done:
-                        return
-
-                    time.sleep(pypeln_utils.TIMEOUT)
-
-                asyncio.run_coroutine_threadsafe(queue.put(x), loop)
-
-            asyncio.run_coroutine_threadsafe(queue.worker_done(), loop)
+            FromIterable.put(worker, queue, pypeln_utils.DONE, loop)
 
         except BaseException as e:
-            e = queue.get_pipeline_exception(e)
-            asyncio.run_coroutine_threadsafe(queue.raise_exception(e), loop)
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    queue.raise_exception(e), loop
+                ).result()
+            except BaseException:
+                pass
+
+    @staticmethod
+    def put(
+        worker: Worker,
+        queue: IterableQueue,
+        x: tp.Any,
+        loop: asyncio.AbstractEventLoop,
+    ) -> bool:
+        """
+        Put `x` into the internal queue and only return once it is really
+        there, so the producer respects `maxsize` and never leaves a pending
+        coroutine behind. Returns `False` when the worker is gone (failure,
+        timeout or early close) and production should stop.
+        """
+
+        async def put():
+            while not worker.is_done:
+                if worker.closed_event is not None and worker.closed_event.is_set():
+                    return False
+
+                put_task = asyncio.ensure_future(queue.put(x))
+                closed_task = asyncio.ensure_future(_wait_closed(worker))
+
+                try:
+                    await asyncio.wait(
+                        [put_task, closed_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    if not put_task.done():
+                        put_task.cancel()
+
+                    if not closed_task.done():
+                        closed_task.cancel()
+
+                    await asyncio.gather(
+                        put_task, closed_task, return_exceptions=True
+                    )
+
+                if put_task.done() and not put_task.cancelled():
+                    exception = put_task.exception()
+
+                    if exception is None:
+                        return True
+
+                    return False
+
+                # The worker closed before the item could be delivered.
+                if worker.is_done:
+                    return False
+
+            return False
+
+        try:
+            return asyncio.run_coroutine_threadsafe(put(), loop).result()
+        except BaseException:
+            # The loop is gone, there is nobody left to consume.
+            return False
 
 
 @tp.overload
